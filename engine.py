@@ -201,8 +201,17 @@ async def _apply(bot: Bot, message: Message, policy: dict) -> None:
 
 async def process_via_message(bot: Bot, message: Message) -> None:
     """Resolve and apply the effective policy for a via-bot message."""
+    from utils import bot_can_delete
     chat_id  = message.chat.id
     username = (message.via_bot.username or "").lower()
+
+    # Skip silently if the bot has no delete rights — nothing useful we can do
+    if not await bot_can_delete(bot, chat_id):
+        logger.warning(
+            "Skipping policy for @%s in chat %d — bot lacks delete rights",
+            username, chat_id,
+        )
+        return
 
     policy = await db.get_bot_policy(chat_id, username)
     logger.info(
