@@ -1,4 +1,4 @@
-"""All message and command handlers."""
+"""Group handlers — bash-like commands + via-bot message processing."""
 from __future__ import annotations
 
 import asyncio
@@ -7,19 +7,43 @@ import os
 import sys
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
-from aiogram.types import ChatMemberUpdated, Message
+from aiogram.filters import BaseFilter, Command
+from aiogram.types import Message
 
 import config
 import db
+from engine import PolicyParseError, describe_policy, parse_policy_args, POLICY_TYPES
 from utils import is_admin, schedule_delete, smart_reply
 
-# conveniences
-_get_banned      = db.get_banned_bots
-_get_whitelisted = db.get_whitelisted_bots
-
 logger = logging.getLogger(__name__)
-router = Router(name="main")
+router = Router(name="group")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Bash-like command filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Cmd(BaseFilter):
+    """Match messages whose first word equals one of the given verbs (case-insensitive).
+    Only fires in group/supergroup chats.
+    """
+
+    def __init__(self, *verbs: str) -> None:
+        self._verbs = {v.lower() for v in verbs}
+
+    async def __call__(self, message: Message) -> bool:
+        if message.chat.type not in ("group", "supergroup"):
+            return False
+        if not message.text:
+            return False
+        first = message.text.strip().split()[0].lower()
+        return first in self._verbs
+
+
+def _args(message: Message, skip: int = 1) -> list[str]:
+    """Return command arguments, skipping the first `skip` words."""
+    parts = (message.text or "").split()
+    return parts[skip:]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,12 +51,11 @@ router = Router(name="main")
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _require_admin(message: Message, bot: Bot) -> bool:
-    """Return True if user is admin/owner; send an error and return False otherwise."""
-    if message.chat.type == "private":
-        await message.answer("❌ Эта команда работает только в группах.")
-        return False
     if not await is_admin(bot, message.chat.id, message.from_user.id):
-        err = await message.answer("❌ Только администраторы с правом <b>удаления сообщений</b> могут управлять ботом.")
+        err = await message.answer(
+            "❌ Только администраторы с правом <b>удаления сообщений</b> "
+            "могут управлять ботом."
+        )
         schedule_delete(bot, message.chat.id, err.message_id, 8)
         schedule_delete(bot, message.chat.id, message.message_id, 3)
         return False
@@ -40,19 +63,18 @@ async def _require_admin(message: Message, bot: Bot) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Owner-only commands
+#  Owner — hot reload
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.message(Command("reload"), F.from_user.id == config.OWNER_ID)
 async def cmd_reload(message: Message) -> None:
-    """Hot-reload: replace the current process with a fresh one."""
     await message.answer("🔄 Перезапуск бота…")
-    logger.info("Hot reload triggered by owner (id=%d)", message.from_user.id)
-    await asyncio.sleep(0.5)          # let the answer send before we die
+    logger.info("Hot reload by owner id=%d", message.from_user.id)
+    await asyncio.sleep(0.5)
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
-@router.message(Command("reload"))   # anyone else
+@router.message(Command("reload"))
 async def cmd_reload_denied(message: Message, bot: Bot) -> None:
     err = await message.answer("🚫 Только владелец бота может перезагружать его.")
     if message.chat.type in ("group", "supergroup"):
@@ -61,225 +83,255 @@ async def cmd_reload_denied(message: Message, bot: Bot) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Admin commands — per-chat configuration
+#  /togglecmds  /toggleown  /chatstatus  /help
 # ─────────────────────────────────────────────────────────────────────────────
-
-@router.message(Command("setdelay"))
-async def cmd_setdelay(message: Message, bot: Bot) -> None:
-    """Set the via-bot deletion delay for this chat (seconds)."""
-    if not await _require_admin(message, bot):
-        return
-
-    parts = (message.text or "").split()
-    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await smart_reply(
-            message, bot,
-            "ℹ️ <b>Использование:</b> /setdelay &lt;секунды&gt;\n"
-            "Пример: <code>/setdelay 120</code>\n"
-            "Диапазон: 3 – 3 600 с.",
-        )
-        return
-
-    delay = int(parts[1])
-    if not (3 <= delay <= 3600):
-        await smart_reply(message, bot, "❌ Задержка должна быть от 3 до 3 600 секунд.")
-        return
-
-    await db.upsert_settings(message.chat.id, delete_delay=delay)
-    await smart_reply(message, bot, f"✅ Задержка удаления via-сообщений: <b>{delay} с.</b>")
-
 
 @router.message(Command("togglecmds"))
 async def cmd_toggle_commands(message: Message, bot: Bot) -> None:
-    """Toggle automatic deletion of command messages in this chat."""
-    if not await _require_admin(message, bot):
-        return
-    settings = await db.get_settings(message.chat.id)
-    new_val = 0 if settings["delete_commands"] else 1
-    await db.upsert_settings(message.chat.id, delete_commands=new_val)
-    state = "включено ✅" if new_val else "выключено ❌"
-    await smart_reply(message, bot, f"Удаление команд: <b>{state}</b>")
+    if not await _require_admin(message, bot): return
+    s = await db.get_settings(message.chat.id)
+    v = 0 if s["delete_commands"] else 1
+    await db.upsert_settings(message.chat.id, delete_commands=v)
+    await smart_reply(message, bot, f"Удаление команд: <b>{'вкл ✅' if v else 'выкл ❌'}</b>")
 
 
 @router.message(Command("toggleown"))
 async def cmd_toggle_own(message: Message, bot: Bot) -> None:
-    """Toggle auto-deletion of the bot's own replies in this chat."""
-    if not await _require_admin(message, bot):
-        return
-    settings = await db.get_settings(message.chat.id)
-    new_val = 0 if settings["delete_own"] else 1
-    await db.upsert_settings(message.chat.id, delete_own=new_val)
-    state = "включено ✅" if new_val else "выключено ❌"
-    await smart_reply(
-        message, bot,
-        f"Удаление ответов бота: <b>{state}</b>\n"
-        f"(TTL = {'<code>delete_delay</code>' if new_val else f'<b>{config.BOT_REPLY_TTL} с.</b>'})",
-    )
-
-
-@router.message(Command("banbot"))
-async def cmd_banbot(message: Message, bot: Bot) -> None:
-    """Add an inline bot to the instant-delete list for this chat."""
-    if not await _require_admin(message, bot):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await smart_reply(message, bot, "ℹ️ <b>Использование:</b> /banbot @username")
-        return
-
-    username = parts[1].lstrip("@").lower()
-    added = await db.add_banned_bot(message.chat.id, username)
-    if added:
-        await smart_reply(
-            message, bot,
-            f"🚫 <b>@{username}</b> добавлен в бан-лист.\n"
-            "Его сообщения будут удаляться <b>мгновенно</b>.",
-        )
-    else:
-        await smart_reply(message, bot, f"⚠️ <b>@{username}</b> уже в бан-листе.")
-
-
-@router.message(Command("unbanbot"))
-async def cmd_unbanbot(message: Message, bot: Bot) -> None:
-    """Remove an inline bot from the instant-delete list."""
-    if not await _require_admin(message, bot):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await smart_reply(message, bot, "ℹ️ <b>Использование:</b> /unbanbot @username")
-        return
-
-    username = parts[1].lstrip("@").lower()
-    removed = await db.remove_banned_bot(message.chat.id, username)
-    if removed:
-        await smart_reply(message, bot, f"✅ <b>@{username}</b> удалён из бан-листа.")
-    else:
-        await smart_reply(message, bot, f"⚠️ <b>@{username}</b> не был в бан-листе.")
-
-
-@router.message(Command("whitebot"))
-async def cmd_whitebot(message: Message, bot: Bot) -> None:
-    """Add an inline bot to the whitelist — its messages will never be deleted."""
-    if not await _require_admin(message, bot):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await smart_reply(message, bot, "ℹ️ <b>Использование:</b> /whitebot @username")
-        return
-
-    username = parts[1].lstrip("@").lower()
-
-    # A bot can't be in both lists at once — remove from ban if present
-    was_banned = await db.remove_banned_bot(message.chat.id, username)
-    added = await db.add_whitelisted_bot(message.chat.id, username)
-
-    if added:
-        note = " (и удалён из бан-листа)" if was_banned else ""
-        await smart_reply(
-            message, bot,
-            f"✅ <b>@{username}</b> добавлен в белый список{note}.\n"
-            "Его сообщения <b>не будут удаляться</b>.",
-        )
-    else:
-        await smart_reply(message, bot, f"⚠️ <b>@{username}</b> уже в белом списке.")
-
-
-@router.message(Command("unwhitebot"))
-async def cmd_unwhitebot(message: Message, bot: Bot) -> None:
-    """Remove an inline bot from the whitelist."""
-    if not await _require_admin(message, bot):
-        return
-    parts = (message.text or "").split()
-    if len(parts) != 2:
-        await smart_reply(message, bot, "ℹ️ <b>Использование:</b> /unwhitebot @username")
-        return
-
-    username = parts[1].lstrip("@").lower()
-    removed = await db.remove_whitelisted_bot(message.chat.id, username)
-    if removed:
-        await smart_reply(
-            message, bot,
-            f"✅ <b>@{username}</b> удалён из белого списка.\n"
-            f"Теперь его сообщения будут удаляться по общему таймеру.",
-        )
-    else:
-        await smart_reply(message, bot, f"⚠️ <b>@{username}</b> не был в белом списке.")
+    if not await _require_admin(message, bot): return
+    s = await db.get_settings(message.chat.id)
+    v = 0 if s["delete_own"] else 1
+    await db.upsert_settings(message.chat.id, delete_own=v)
+    await smart_reply(message, bot, f"Автоудаление ответов бота: <b>{'вкл ✅' if v else 'выкл ❌'}</b>")
 
 
 @router.message(Command("chatstatus"))
 async def cmd_chat_status(message: Message, bot: Bot) -> None:
-    """Show current settings for this chat."""
-    if not await _require_admin(message, bot):
-        return
-    settings    = await db.get_settings(message.chat.id)
-    banned      = await db.get_banned_bots(message.chat.id)
-    whitelisted = await db.get_whitelisted_bots(message.chat.id)
+    if not await _require_admin(message, bot): return
+    s           = await db.get_settings(message.chat.id)
+    policies    = await db.get_policies(message.chat.id)
+    assignments = await db.get_bot_assignments(message.chat.id)
 
-    def fmt(bots: set[str]) -> str:
-        return "\n".join(f"  • @{u}" for u in sorted(bots)) if bots else "  нет"
+    pol_lines = []
+    for p in policies:
+        import json as _json
+        cfg  = _json.loads(p.get("config") or "{}")
+        desc = describe_policy(p["type"], cfg)
+        mark = " ⭐" if p["is_default"] else ""
+        pol_lines.append(f"  • <b>{p['name']}</b>{mark} — {p['type']} ({desc})")
+
+    ass_lines = [f"  • @{a['bot_username']} → {a['policy_name']}" for a in assignments] or ["  нет"]
 
     text = (
         "⚙️ <b>Настройки чата</b>\n\n"
-        f"⏱ Задержка удаления via: <b>{settings['delete_delay']} с.</b>\n"
-        f"🗑 Удалять команды: <b>{'да' if settings['delete_commands'] else 'нет'}</b>\n"
-        f"🤖 Удалять ответы бота: <b>{'да' if settings['delete_own'] else 'нет'}</b>\n\n"
-        f"🚫 <b>Бан-лист</b> (мгновенное удаление):\n{fmt(banned)}\n\n"
-        f"✅ <b>Белый список</b> (никогда не удалять):\n{fmt(whitelisted)}"
+        f"🗑 Удалять команды: <b>{'да' if s['delete_commands'] else 'нет'}</b>\n"
+        f"🤖 Удалять ответы бота: <b>{'да' if s['delete_own'] else 'нет'}</b>\n\n"
+        f"📋 <b>Политики:</b>\n" + "\n".join(pol_lines or ["  нет"]) + "\n\n"
+        f"🔗 <b>Назначения ботов:</b>\n" + "\n".join(ass_lines)
     )
     await smart_reply(message, bot, text)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Help / start
-# ─────────────────────────────────────────────────────────────────────────────
-
 HELP_TEXT = (
-    "🤖 <b>Inline Deleter Bot</b>\n\n"
-    "<b>Команды администратора (только в группах):</b>\n"
-    "/setdelay &lt;сек&gt; — задержка удаления via-сообщений\n"
-    "/togglecmds — вкл/выкл удаление команд пользователей\n"
-    "/toggleown — вкл/выкл автоудаление ответов бота\n\n"
-    "🚫 <b>Бан-лист</b> (мгновенное удаление):\n"
-    "/banbot @username — добавить бота в бан\n"
-    "/unbanbot @username — убрать из бана\n\n"
-    "✅ <b>Белый список</b> (никогда не удалять):\n"
-    "/whitebot @username — добавить бота в белый список\n"
-    "/unwhitebot @username — убрать из белого списка\n\n"
-    "/chatstatus — текущие настройки чата\n\n"
-    "<b>Только для владельца:</b>\n"
-    "/reload — горячая перезагрузка процесса бота\n\n"
-    "<i>Приоритет: белый список &gt; бан-лист &gt; общий таймер</i>"
+    "📖 <b>Inline Deleter — справка</b>\n\n"
+    "<b>Slash-команды:</b>\n"
+    "/togglecmds — вкл/выкл удаление команд\n"
+    "/toggleown  — вкл/выкл удаление ответов бота\n"
+    "/chatstatus — состояние чата\n"
+    "/reload     — перезагрузка (только владелец)\n\n"
+    "<b>Политики</b> (без /):  <code>policy &lt;subcmd&gt;</code>\n"
+    "  <code>policy list</code>\n"
+    "  <code>policy new &lt;name&gt; &lt;type&gt; [args]</code>\n"
+    "  <code>policy set default &lt;name&gt;</code>\n"
+    "  <code>policy rename &lt;old&gt; &lt;new&gt;</code>\n"
+    "  <code>policy del &lt;name&gt;</code>\n"
+    "  <code>policy show &lt;name&gt;</code>\n\n"
+    "<b>Типы политик:</b>\n"
+    "  <code>whitelist</code>              — не удалять\n"
+    "  <code>blacklist</code>              — мгновенно\n"
+    "  <code>delay &lt;сек&gt;</code>            — через N секунд\n"
+    "  <code>throttle &lt;N&gt;/&lt;сек&gt;</code>      — не более N за окно\n"
+    "  <code>schedule &lt;HH:MM&gt;-&lt;HH:MM&gt; [UTC±N]</code>\n"
+    "  <code>shadow &lt;MIN&gt;-&lt;MAX&gt;</code>       — случайная задержка\n\n"
+    "<b>Боты:</b>  <code>bot &lt;subcmd&gt;</code>\n"
+    "  <code>bot assign @username &lt;policy&gt;</code>\n"
+    "  <code>bot unassign @username</code>\n"
+    "  <code>bot list</code>\n\n"
+    "⭐ = политика по умолчанию  |  ЛС → /start для меню"
 )
 
 
 @router.message(Command("help"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_help(message: Message, bot: Bot) -> None:
     sent = await message.answer(HELP_TEXT)
-    settings = await db.get_settings(message.chat.id)
-    delay = settings["delete_delay"] if settings["delete_own"] else 60
-    schedule_delete(bot, message.chat.id, sent.message_id, delay)
+    schedule_delete(bot, message.chat.id, sent.message_id, 120)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Track bot membership in chats
+#  policy <subcmd>
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.my_chat_member()
-async def on_bot_membership_change(event: ChatMemberUpdated) -> None:
-    """Track every group/supergroup the bot joins or leaves."""
-    if event.chat.type not in ("group", "supergroup"):
+@router.message(Cmd("policy"))
+async def cmd_policy(message: Message, bot: Bot) -> None:
+    if not await _require_admin(message, bot): return
+    args = _args(message)  # everything after "policy"
+
+    if not args:
+        await smart_reply(message, bot,
+            "ℹ️ policy list | new | set | rename | del | show\n"
+            "Подробнее: /help")
         return
-    new_status = event.new_chat_member.status
-    if new_status in ("member", "administrator"):
-        await db.upsert_known_chat(
-            event.chat.id,
-            event.chat.title or "",
-            event.chat.username or "",
-        )
-        logger.info("Bot joined chat %d (%s)", event.chat.id, event.chat.title)
-    elif new_status in ("left", "kicked", "restricted"):
-        await db.remove_known_chat(event.chat.id)
-        logger.info("Bot left chat %d (%s)", event.chat.id, event.chat.title)
+
+    sub = args[0].lower()
+
+    # ── policy list ──────────────────────────────────────────────────────────
+    if sub == "list":
+        import json as _json
+        policies = await db.get_policies(message.chat.id)
+        if not policies:
+            await smart_reply(message, bot, "Политик нет. Создайте: policy new <name> delay 60")
+            return
+        lines = []
+        for p in policies:
+            cfg  = _json.loads(p.get("config") or "{}")
+            desc = describe_policy(p["type"], cfg)
+            mark = " ⭐" if p["is_default"] else ""
+            lines.append(f"<b>{p['name']}</b>{mark}  <i>{p['type']}</i>  {desc}")
+        await smart_reply(message, bot, "📋 <b>Политики:</b>\n" + "\n".join(lines))
+
+    # ── policy show <name> ───────────────────────────────────────────────────
+    elif sub == "show":
+        if len(args) < 2:
+            await smart_reply(message, bot, "Использование: policy show <name>"); return
+        import json as _json
+        p = await db.get_policy_by_name(message.chat.id, args[1])
+        if not p:
+            await smart_reply(message, bot, f"❌ Политика «{args[1]}» не найдена."); return
+        cfg  = _json.loads(p.get("config") or "{}")
+        desc = describe_policy(p["type"], cfg)
+        mark = "  ⭐ default" if p["is_default"] else ""
+        await smart_reply(message, bot,
+            f"📋 <b>{p['name']}</b>{mark}\n"
+            f"Тип: <code>{p['type']}</code>\n"
+            f"Описание: {desc}\n"
+            f"Config: <code>{_json.dumps(cfg, ensure_ascii=False)}</code>")
+
+    # ── policy new <name> <type> [args...] ───────────────────────────────────
+    elif sub == "new":
+        if len(args) < 3:
+            await smart_reply(message, bot,
+                "Использование: policy new &lt;name&gt; &lt;type&gt; [args]\n"
+                "Типы: " + " | ".join(POLICY_TYPES)); return
+        name  = args[1]
+        ptype = args[2].lower()
+        if ptype not in POLICY_TYPES:
+            await smart_reply(message, bot,
+                f"❌ Неизвестный тип. Доступны: {', '.join(POLICY_TYPES)}"); return
+        try:
+            cfg = parse_policy_args(ptype, args[3:])
+        except PolicyParseError as e:
+            await smart_reply(message, bot, f"❌ {e}"); return
+
+        p = await db.create_policy(message.chat.id, name, ptype, cfg)
+        if p is None:
+            await smart_reply(message, bot, f"❌ Политика «{name}» уже существует."); return
+        desc = describe_policy(ptype, cfg)
+        await smart_reply(message, bot,
+            f"✅ Политика <b>{name}</b> создана: <i>{ptype}</i> — {desc}")
+
+    # ── policy set default <name> ────────────────────────────────────────────
+    elif sub == "set":
+        if len(args) < 3 or args[1].lower() != "default":
+            await smart_reply(message, bot, "Использование: policy set default <name>"); return
+        ok = await db.set_default_policy(message.chat.id, args[2])
+        if ok:
+            await smart_reply(message, bot, f"⭐ Политика по умолчанию: <b>{args[2]}</b>")
+        else:
+            await smart_reply(message, bot, f"❌ Политика «{args[2]}» не найдена.")
+
+    # ── policy rename <old> <new> ────────────────────────────────────────────
+    elif sub == "rename":
+        if len(args) < 3:
+            await smart_reply(message, bot, "Использование: policy rename <old> <new>"); return
+        ok = await db.rename_policy(message.chat.id, args[1], args[2])
+        if ok:
+            await smart_reply(message, bot, f"✅ Переименовано: <b>{args[1]}</b> → <b>{args[2]}</b>")
+        else:
+            await smart_reply(message, bot, f"❌ Не удалось: «{args[1]}» не найдена или «{args[2]}» занято.")
+
+    # ── policy del <name> ────────────────────────────────────────────────────
+    elif sub == "del":
+        if len(args) < 2:
+            await smart_reply(message, bot, "Использование: policy del <name>"); return
+        result = await db.delete_policy(message.chat.id, args[1])
+        if result == "ok":
+            await smart_reply(message, bot, f"🗑 Политика <b>{args[1]}</b> удалена.")
+        elif result == "is_default":
+            await smart_reply(message, bot,
+                "❌ Нельзя удалить политику по умолчанию.\n"
+                "Сначала назначьте другую: policy set default <name>")
+        else:
+            await smart_reply(message, bot, f"❌ Политика «{args[1]}» не найдена.")
+
+    else:
+        await smart_reply(message, bot,
+            f"❓ Неизвестная подкоманда «{sub}».\nℹ️ policy list | new | set | rename | del | show")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  bot <subcmd>
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.message(Cmd("bot"))
+async def cmd_bot(message: Message, bot: Bot) -> None:
+    if not await _require_admin(message, bot): return
+    args = _args(message)
+
+    if not args:
+        await smart_reply(message, bot, "ℹ️ bot assign | unassign | list"); return
+
+    sub = args[0].lower()
+
+    # ── bot list ─────────────────────────────────────────────────────────────
+    if sub == "list":
+        assignments = await db.get_bot_assignments(message.chat.id)
+        default     = await db.get_default_policy(message.chat.id)
+        if not assignments:
+            await smart_reply(message, bot,
+                f"Назначений нет. Все боты → политика по умолчанию (<b>{default['name']}</b>)."); return
+        lines = [f"@{a['bot_username']} → <b>{a['policy_name']}</b> <i>({a['policy_type']})</i>"
+                 for a in assignments]
+        await smart_reply(message, bot,
+            f"🤖 <b>Назначения ботов:</b>\n" + "\n".join(lines) +
+            f"\n\nОстальные → <b>{default['name']}</b> (default)")
+
+    # ── bot assign @username <policy> ────────────────────────────────────────
+    elif sub == "assign":
+        if len(args) < 3:
+            await smart_reply(message, bot, "Использование: bot assign @username <policy>"); return
+        username    = args[1].lstrip("@").lower()
+        policy_name = args[2]
+        result = await db.assign_bot(message.chat.id, username, policy_name)
+        if result == "ok":
+            await smart_reply(message, bot,
+                f"✅ @{username} → политика <b>{policy_name}</b>")
+        else:
+            await smart_reply(message, bot, f"❌ Политика «{policy_name}» не найдена.")
+
+    # ── bot unassign @username ────────────────────────────────────────────────
+    elif sub == "unassign":
+        if len(args) < 2:
+            await smart_reply(message, bot, "Использование: bot unassign @username"); return
+        username = args[1].lstrip("@").lower()
+        removed  = await db.unassign_bot(message.chat.id, username)
+        if removed:
+            default = await db.get_default_policy(message.chat.id)
+            await smart_reply(message, bot,
+                f"✅ Назначение @{username} снято → теперь через default (<b>{default['name']}</b>)")
+        else:
+            await smart_reply(message, bot, f"⚠️ @{username} не имел назначения.")
+
+    else:
+        await smart_reply(message, bot, f"❓ Неизвестная подкоманда «{sub}».")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,40 +340,5 @@ async def on_bot_membership_change(event: ChatMemberUpdated) -> None:
 
 @router.message(F.via_bot)
 async def handle_via_message(message: Message, bot: Bot) -> None:
-    chat_id = message.chat.id
-    via_username = (message.via_bot.username or "").lower()
-
-    # Keep known_chats table fresh (title may change)
-    if message.chat.type in ("group", "supergroup"):
-        await db.upsert_known_chat(
-            chat_id,
-            message.chat.title or "",
-            message.chat.username or "",
-        )
-
-    # ── 1. Whitelist check — highest priority, do nothing ─────────────────────
-    whitelisted = await db.get_whitelisted_bots(chat_id)
-    if via_username in whitelisted:
-        logger.debug(
-            "Whitelist pass: @%s msg=%d chat=%d", via_username, message.message_id, chat_id
-        )
-        return
-
-    # ── 2. Banlist check — instant delete ─────────────────────────────────────
-    banned = await db.get_banned_bots(chat_id)
-    if via_username in banned:
-        logger.info(
-            "Instant delete (banned): @%s msg=%d chat=%d",
-            via_username, message.message_id, chat_id,
-        )
-        schedule_delete(bot, chat_id, message.message_id, 0)
-        return
-
-    # ── 3. Default — delete after configured delay ────────────────────────────
-    settings = await db.get_settings(chat_id)
-    delay = settings["delete_delay"]
-    logger.info(
-        "Schedule delete: via @%s msg=%d chat=%d delay=%ds",
-        via_username, message.message_id, chat_id, delay,
-    )
-    schedule_delete(bot, chat_id, message.message_id, delay)
+    from engine import process_via_message
+    await process_via_message(bot, message)

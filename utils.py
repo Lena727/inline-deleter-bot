@@ -1,7 +1,8 @@
-"""Shared helpers used across handlers and middleware."""
+"""Shared helpers."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 from aiogram import Bot
@@ -12,8 +13,6 @@ import db
 
 logger = logging.getLogger(__name__)
 
-
-# ── Delayed deletion ──────────────────────────────────────────────────────────
 
 async def _delete_after(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
     if delay > 0:
@@ -26,20 +25,10 @@ async def _delete_after(bot: Bot, chat_id: int, message_id: int, delay: int) -> 
 
 
 def schedule_delete(bot: Bot, chat_id: int, message_id: int, delay: int) -> None:
-    """Fire-and-forget: schedule message deletion without blocking."""
     asyncio.create_task(_delete_after(bot, chat_id, message_id, delay))
 
 
-# ── Admin check ───────────────────────────────────────────────────────────────
-
 async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
-    """Return True if the user may manage the bot in this chat.
-
-    Rules:
-    - Bot owner (OWNER_ID)       — always allowed.
-    - Chat owner (ChatMemberOwner) — always allowed.
-    - Administrator               — only if can_delete_messages is True.
-    """
     if user_id == config.OWNER_ID:
         return True
     try:
@@ -53,20 +42,23 @@ async def is_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
         return False
 
 
-# ── Smart reply ───────────────────────────────────────────────────────────────
-
 async def smart_reply(message: Message, bot: Bot, text: str, **kwargs) -> Message:
-    """Send a reply and schedule its deletion based on chat settings.
-
-    - delete_own ON  → deleted after ``delete_delay`` seconds
-    - delete_own OFF → deleted after BOT_REPLY_TTL seconds (default 30 s)
-    Private chats are never scheduled for deletion.
-    """
+    """Send a reply; schedule its deletion based on chat settings + default policy."""
     sent = await message.answer(text, **kwargs)
     if message.chat.type not in ("group", "supergroup"):
         return sent
 
     settings = await db.get_settings(message.chat.id)
-    delay = settings["delete_delay"] if settings["delete_own"] else config.BOT_REPLY_TTL
+    if settings["delete_own"]:
+        # Use default policy delay (if it's a delay type), else BOT_REPLY_TTL
+        policy = await db.get_default_policy(message.chat.id)
+        if policy["type"] == "delay":
+            cfg   = json.loads(policy.get("config") or "{}")
+            delay = cfg.get("delay", config.BOT_REPLY_TTL)
+        else:
+            delay = config.BOT_REPLY_TTL
+    else:
+        delay = config.BOT_REPLY_TTL
+
     schedule_delete(bot, message.chat.id, sent.message_id, delay)
     return sent
