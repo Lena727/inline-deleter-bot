@@ -1,0 +1,19 @@
+[Unit]
+Description=Inline Deleter Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/srv/inline_deleter
+EnvironmentFile=/srv/inline_deleter/.env
+ExecStart=/srv/inline_deleter/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+
+# Allow os.execv hot-reload to work:
+# the new process replaces this one but keeps the same PID namespace.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
