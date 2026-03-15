@@ -19,6 +19,7 @@ import db
 from utils import schedule_delete
 
 logger = logging.getLogger(__name__)
+POLICY_TYPES = ("whitelist", "blacklist", "delay", "throttle", "schedule", "shadow")
 
 # {policy_id: {"count": int, "window_start": int}}
 _throttle_counters: dict[int, dict] = defaultdict(lambda: {"count": 0, "window_start": 0})
